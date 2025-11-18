@@ -32,7 +32,7 @@ class GenerateVideoResponse(BaseModel):
             "example": {
                 "success": True,
                 "video_id": "a1b2c3d4e5f6g7h8i9j0",
-                "video_url": "https://example.com/videos/a1b2c3d4e5f6g7h8i9j0.mp4",
+                "video_url": "https://example.com/api/v1/vitual/videos/a1b2c3d4e5f6g7h8i9j0.mp4",
                 "message": "视频生成成功"
             }
         }

@@ -274,7 +274,7 @@
     </div>
 
     <script>
-        const API_BASE_URL = 'http://localhost:8000/api/v1/virtual';
+        const API_BASE_URL = 'http://0.0.0.0:8201/api/v1/virtual';
 
         function showLoading(buttonId) {
             const btn = document.getElementById(buttonId);
@@ -305,10 +305,10 @@
                     <div class="video-info">消息: ${result.message}</div>
                     <div class="video-url">
                         <strong>视频链接:</strong><br>
-                        <a href="http://localhost:8000${result.video_url}" target="_blank">http://localhost:8000${result.video_url}</a>
+                        <a href="http://0.0.0.0:8201${result.video_url}" target="_blank">http://0.0.0.0:8201${result.video_url}</a>
                     </div>
                     <video class="video-player" controls>
-                        <source src="http://localhost:8000${result.video_url}" type="video/mp4">
+                        <source src="http://0.0.0.0:8201${result.video_url}" type="video/mp4">
                         您的浏览器不支持视频播放。
                     </video>
                 `;

@@ -7,16 +7,18 @@ import requests
 from pypinyin import lazy_pinyin, Style
 from moviepy.editor import concatenate_videoclips, ImageClip, AudioFileClip
 from PIL import Image
-from fastapi import APIRouter,FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from virtual.shcemas import GenerateVideoRequest, GenerateVideoResponse
 from pathlib import Path
+import gc
 
 router = APIRouter(
     prefix="/virtual",
     tags=["virtual"]
 )
 
+VIRTUAL_VIDEOS_DIR = Path("uploads") / "aividfromppt" / "videos"
+VIRTUAL_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 # ----------  口型表 ----------
 VIS_MAP = {
     # 中文声母 & 英文首字母 → 口型编号
@@ -38,7 +40,8 @@ VIS_MAP = {
     'A':'04','E':'06','I':'06','O':'07','U':'08'
 }
 
-def phone2vis(p): return VIS_MAP.get(p, '03')
+def phone2vis(p): 
+    return VIS_MAP.get(p, '03')
 
 def split_zh_en(text):
     return re.findall(r'([\u4e00-\u9fa5]+|[a-zA-Z]+)', text)
@@ -57,20 +60,7 @@ def build_vis_seq(sentence):
 def blend_pair(img_a: str, img_b: str, duration: float, fps: int, blend_n: int):
     """
     混合两张口型图片，生成平滑过渡的视频片段。
-    
-    Args:
-        img_a: 第一张图片路径
-        img_b: 第二张图片路径
-        duration: 过渡持续时间
-        fps: 帧率
-        blend_n: 过渡帧数
-    
-    Returns:
-        混合后的视频片段
-    
-    Raises:
-        FileNotFoundError: 当图片文件不存在时
-        Exception: 其他图片处理或视频生成错误
+    修复: 确保numpy数组在ImageClip使用期间保持有效
     """
     # 验证图片文件是否存在
     if not Path(img_a).exists():
@@ -83,164 +73,187 @@ def blend_pair(img_a: str, img_b: str, duration: float, fps: int, blend_n: int):
     clips = []
     
     try:
-        for i in range(1, blend_n+1):
+        # 加载图片并转换为RGBA
+        img_a_pil = Image.open(img_a).convert('RGBA')
+        img_b_pil = Image.open(img_b).convert('RGBA')
+        
+        # 生成过渡帧
+        for i in range(1, blend_n + 1):
             w = i / (blend_n + 1)
-            blended = Image.blend(Image.open(img_a).convert('RGBA'),
-                                  Image.open(img_b).convert('RGBA'), w)
-            clips.append(ImageClip(np.array(blended), duration=1/fps))
-        clips.append(ImageClip(img_b, duration=still_n/fps))
-        return concatenate_videoclips(clips, method="compose")
+            blended = Image.blend(img_a_pil, img_b_pil, w)
+            # 复制数组确保数据独立，使用copy()确保内存连续
+            blended_array = np.array(blended, dtype=np.uint8).copy()
+            blended.close()
+            clips.append(ImageClip(blended_array, duration=1/fps))
+        
+        # 最后一帧使用 img_b，也需要copy
+        img_b_array = np.array(img_b_pil, dtype=np.uint8).copy()
+        clips.append(ImageClip(img_b_array, duration=still_n/fps))
+        
+        # 关闭PIL图片对象
+        img_a_pil.close()
+        img_b_pil.close()
+        
+        # 连接所有片段
+        result = concatenate_videoclips(clips, method="compose")
+        
+        return result
+        
     except Exception as e:
+        # 异常时清理资源
+        for clip in clips:
+            try:
+                clip.close()
+            except:
+                pass
         raise Exception(f"图片混合失败: {str(e)}")
 
 def build_smooth_video(vis_seq, fps, char_interval, blend_n, lip_dir):
     """
     根据口型序列生成平滑的视频。
-    
-    Args:
-        vis_seq: 口型序列
-        fps: 帧率
-        char_interval: 每个字符的持续时间
-        blend_n: 口型过渡帧数
-        lip_dir: 口型图片目录
-    
-    Returns:
-        生成的视频片段
-    
-    Raises:
-        FileNotFoundError: 当口型图片文件不存在时
-        Exception: 其他视频生成错误
+    修复: 只在最终视频生成后才释放中间clips
     """
     clips = []
     
-    for i, vis in enumerate(vis_seq):
-        img = f"{lip_dir}/{vis}.png"
-        
-        # 验证图片文件是否存在
-        if not Path(img).exists():
-            raise FileNotFoundError(f"口型图片不存在: {img}")
-            
-        if i == 0:
-            try:
-                clips.append(ImageClip(img, duration=char_interval))
-            except Exception as e:
-                raise Exception(f"创建图片视频片段失败: {str(e)}")
-            continue
-            
-        prev_img = f"{lip_dir}/{vis_seq[i-1]}.png"
-        clips.append(blend_pair(prev_img, img, char_interval, fps, blend_n))
-    
     try:
-        return concatenate_videoclips(clips, method="compose")
+        for i, vis in enumerate(vis_seq):
+            img = f"{lip_dir}/{vis}.png"
+            
+            # 验证图片文件是否存在
+            if not Path(img).exists():
+                raise FileNotFoundError(f"口型图片不存在: {img}")
+                
+            if i == 0:
+                # 加载第一帧，使用copy确保数据独立
+                img_pil = Image.open(img).convert('RGBA')
+                img_array = np.array(img_pil, dtype=np.uint8).copy()
+                img_pil.close()
+                clips.append(ImageClip(img_array, duration=char_interval))
+            else:
+                prev_img = f"{lip_dir}/{vis_seq[i-1]}.png"
+                clip = blend_pair(prev_img, img, char_interval, fps, blend_n)
+                clips.append(clip)
+        
+        # 确保所有clips都已生成
+        if not clips:
+            raise ValueError("没有生成任何视频片段")
+        
+        # 连接所有片段
+        result = concatenate_videoclips(clips, method="compose")
+        
+        return result, clips  # 返回clips以便后续清理
+        
     except Exception as e:
-        raise Exception(f"拼接视频片段失败: {str(e)}")
-    
-    
-def _load_audio_robust(audio_file_path_or_url):
-        """
-        稳健加载音频：支持本地路径和 http/https 远程 URL
-        自动处理下载、流式写入、临时文件清理
-        """
-        # 1. 本地文件直接加载（最快）
-        if os.path.isfile(audio_file_path_or_url):
-            return AudioFileClip(audio_file_path_or_url)
-
-        # 2. 远程 URL：先下载到临时文件再加载（解决 FFmpeg probe 失败问题）
-        if audio_file_path_or_url.startswith(("http://", "https://")):
-            print(f"正在下载远程音频文件: {audio_file_path_or_url}")
+        # 异常处理：清理资源
+        for clip in clips:
             try:
-                # 流式下载，防止大文件爆内存
-                response = requests.get(audio_file_path_or_url, stream=True, timeout=30)
-                response.raise_for_status()
+                clip.close()
+            except:
+                pass
+        raise Exception(f"拼接视频片段失败: {str(e)}")
 
-                # 创建命名临时文件（带 .mp3 后缀有助于 MoviePy 识别）
-                suffix = os.path.splitext(audio_file_path_or_url)[1] or ".mp3"
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+def _load_audio_robust(audio_file_path_or_url):
+    """
+    稳健加载音频：支持本地路径和 http/https 远程 URL
+    优化: 减小下载块大小，确保文件正确关闭
+    """
+    # 1. 本地文件直接加载
+    if os.path.isfile(audio_file_path_or_url):
+        return AudioFileClip(audio_file_path_or_url)
+
+    # 2. 远程 URL：先下载到临时文件再加载
+    if audio_file_path_or_url.startswith(("http://", "https://")):
+        print(f"正在下载远程音频文件: {audio_file_path_or_url}")
+        tmp_file_path = None
+        try:
+            response = requests.get(audio_file_path_or_url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            suffix = os.path.splitext(audio_file_path_or_url)[1] or ".mp3"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                tmp_file_path = tmp_file.name
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        tmp_file.write(chunk)
+            
+            audio = AudioFileClip(tmp_file_path)
+            
+            # 注册清理函数
+            original_close = audio.close
+            def _cleanup_close():
+                original_close()
                 try:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            tmp_file.write(chunk)
-                    tmp_file.close()
-
-                    # 用临时文件创建 AudioClip
-                    audio = AudioFileClip(tmp_file.name)
-                    
-                    # 注册清理函数，确保最终一定删除临时文件
-                    def _cleanup():
-                        try:
-                            os.unlink(tmp_file.name)
-                        except:
-                            pass
-                    audio._cleanup = _cleanup  # 简单挂钩，MoviePy 关闭时会尝试清理
-                    return audio
+                    if tmp_file_path and os.path.exists(tmp_file_path):
+                        os.unlink(tmp_file_path)
                 except:
-                    # 下载或写入失败也要删掉残留文件
-                    try:
-                        os.unlink(tmp_file.name)
-                    except:
-                        pass
-                    raise
-            except requests.RequestException as e:
-                raise ConnectionError(f"下载音频失败: {e}")
+                    pass
+            audio.close = _cleanup_close
+            
+            return audio
+            
+        except requests.RequestException as e:
+            if tmp_file_path:
+                try:
+                    os.unlink(tmp_file_path)
+                except:
+                    pass
+            raise ConnectionError(f"下载音频失败: {e}")
+        except Exception as e:
+            if tmp_file_path:
+                try:
+                    os.unlink(tmp_file_path)
+                except:
+                    pass
+            raise
 
-        # 3. 其他情况（比如 file:// 协议等）直接交给 MoviePy 尝试
-        return AudioFileClip(audio_file_path_or_url)    
+    # 3. 其他情况
+    return AudioFileClip(audio_file_path_or_url)
 
-# ---------- 封装的生成视频方法 ----------
 def generate_video(text, output_video, audio_file, fps=30, char_interval=0.5, blend_n=5, gender=1):
-    """
-    生成口型同步视频。
-    
-    Args:
-        text: 用于口型同步的文本内容
-        output_video: 输出视频文件路径
-        audio_file: 音频文件地址
-        fps: 视频帧率
-        char_interval: 每个字符的持续时间（秒）
-        blend_n: 口型过渡的帧数
-        gender: 说话者性别 (1 为男性, 0 为女性)
-    
-    Returns:
-        生成的视频文件路径
-    
-    Raises:
-        FileNotFoundError: 当口型图片文件或音频文件不存在时
-        PermissionError: 当没有权限访问文件或目录时
-        Exception: 其他视频生成过程中的错误
-    """
-    # 根据gender参数构建口型图片目录路径
     gender_folder = 'male' if gender == 1 else 'female'
     lip_dir = Path(__file__).parent / 'mouse-sort' / gender_folder
     
-    # 验证口型图片目录是否存在
     if not lip_dir.exists():
         raise FileNotFoundError(f"口型图片目录不存在: {lip_dir}")
     
     # 生成口型序列
     vis_seq = build_vis_seq(text)
-    
     print('viseme ->', vis_seq)
-    print(f'使用口型图片目录: {lip_dir}')
     
-    # 生成平滑视频
-    video_clip = build_smooth_video(vis_seq, fps, char_interval, blend_n, str(lip_dir))
-
+    video_clip = None
+    audio_clip = None
+    final_clip = None
+    intermediate_clips = []  # 保存中间clips引用
+    
     try:
+        # 生成平滑视频
+        video_clip, intermediate_clips = build_smooth_video(vis_seq, fps, char_interval, blend_n, str(lip_dir))
+        
+        # 加载音频
         audio_clip = _load_audio_robust(audio_file)
-        final_clip = video_clip.set_audio(audio_clip)  # 音画对位
-        # 如果音频更长，让视频自动延长到音频尾
+        
+        # 音画对位
+        final_clip = video_clip.set_audio(audio_clip)
+        
+        # 如果音频更长，让视频延长到音频尾
         if audio_clip.duration > video_clip.duration:
             final_clip = final_clip.set_duration(audio_clip.duration)
+        
         # 输出视频文件
         final_clip.write_videofile(
             output_video,
             codec='libx264',
             audio_codec='aac',
             fps=fps,
-            logger=None
+            logger=None,
+            threads=2,
+            preset='medium',
+            audio_bitrate='128k',
+            bitrate='2000k'
         )
         
         return output_video
+        
     except Exception as e:
         # 清理可能生成的不完整视频文件
         if Path(output_video).exists():
@@ -249,6 +262,40 @@ def generate_video(text, output_video, audio_file, fps=30, char_interval=0.5, bl
             except:
                 pass
         raise Exception(f"视频生成失败: {str(e)}")
+        
+    finally:
+        # 1. 先关闭最终合成的clip
+        if final_clip:
+            try:
+                final_clip.close()
+            except Exception as e:
+                print(f"关闭final_clip时出错: {e}")
+        
+        # 2. 关闭音频clip
+        if audio_clip:
+            try:
+                audio_clip.close()
+            except Exception as e:
+                print(f"关闭audio_clip时出错: {e}")
+        
+        # 3. 关闭视频clip
+        if video_clip:
+            try:
+                video_clip.close()
+            except Exception as e:
+                print(f"关闭video_clip时出错: {e}")
+        
+        # 4. 最后关闭所有中间clips
+        for clip in intermediate_clips:
+            try:
+                clip.close()
+            except Exception as e:
+                print(f"关闭intermediate_clip时出错: {e}")
+        
+        intermediate_clips.clear()
+        
+        # 5. 强制垃圾回收
+        gc.collect()
 
 
 # 生成接口
@@ -271,23 +318,18 @@ def generate_video(text, output_video, audio_file, fps=30, char_interval=0.5, bl
     """
 )
 def api_generate(req: GenerateVideoRequest):
-    # 验证文本内容
     if not req.text:
         raise HTTPException(status_code=400, detail="文本内容不能为空")
     
-    # 验证性别参数
     if req.gender not in [0, 1]:
         raise HTTPException(status_code=400, detail="性别参数无效，必须为 0（女性）或 1（男性）")
     
-    # 验证字符间隔参数
     if req.char_interval <= 0 or req.char_interval > 2:
         raise HTTPException(status_code=400, detail="字符间隔参数无效，必须在 0 到 2 秒之间")
     
     try:
         vid_name = f"{uuid.uuid4().hex}.mp4"
-        # 使用绝对路径保存视频文件
-        save_path = Path(__file__).parent / "videos" / vid_name
-        save_path.parent.mkdir(exist_ok=True)
+        save_path = VIRTUAL_VIDEOS_DIR / vid_name
         
         generate_video(
             text=req.text,
@@ -296,16 +338,26 @@ def api_generate(req: GenerateVideoRequest):
             gender=req.gender,
             char_interval=req.char_interval
         )
+        base_url = str(Request.base_url).rstrip('/')
+        relative_path = str(save_path)
+        file_url = f"{base_url}/api/v1/upload/files/{relative_path}"
+    
+        
+        # API调用结束后主动回收
+        gc.collect()
                     
         return GenerateVideoResponse(
             success=True,
             video_id=vid_name.split('.')[0],
-            video_url=f"/virtual/videos/{vid_name}",
+            video_url=file_url,
             message="视频生成成功"
         )
+        
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=f"文件未找到: {str(e)}")
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=f"权限不足: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"视频生成失败: {str(e)}")
+    finally:
+        gc.collect()
